@@ -649,7 +649,7 @@ if (!DATABASE_URL) {
 
 // Iniciar servidor
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, async () => {
+app.listen(PORT, '0.0.0.0', async () => {
   console.log(`Servidor backend iniciado en puerto ${PORT}`);
   console.log(`API disponible en: http://localhost:${PORT}/api`);
   console.log(`Health check: http://localhost:${PORT}/api/health`);
