@@ -26,10 +26,32 @@ const authLimiter = rateLimit({
 const allowedOrigins = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
-  process.env.FRONTEND_ORIGIN, // tu dominio principal
-  'https://portion-tracker-frontend.vercel.app', // preview actual
-  'https://portion-tracker*.vercel.app' // para permitir todos los previews (menos seguro)
-];
+  'https://portion-tracker-frontend.vercel.app', // Tu dominio principal en Vercel
+  process.env.FRONTEND_ORIGIN // Variable de entorno adicional si la necesitas
+].filter(Boolean); // Filtra valores undefined/null
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Permitir peticiones sin origin (Postman, etc)
+    if (!origin) return callback(null, true);
+    
+    // Permitir todos los subdominios de Vercel (para previews)
+    if (origin.includes('vercel.app')) {
+      return callback(null, true);
+    }
+    
+    // Verificar si está en la lista de permitidos
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // Si no está permitido
+    return callback(new Error(`Not allowed by CORS: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 app.use(cors({
   origin: (origin, cb) => {
