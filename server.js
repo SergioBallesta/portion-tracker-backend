@@ -23,43 +23,36 @@ const authLimiter = rateLimit({
 });
 
 // Configurar CORS
-const allowedOrigins = [
-  'http://localhost:5173',
-  'http://127.0.0.1:5173',
-  'https://portion-tracker-frontend.vercel.app', // Tu dominio principal en Vercel
-  process.env.FRONTEND_ORIGIN // Variable de entorno adicional si la necesitas
-].filter(Boolean); // Filtra valores undefined/null
-
+// Configurar CORS
 app.use(cors({
   origin: (origin, callback) => {
-    // Permitir peticiones sin origin (Postman, etc)
-    if (!origin) return callback(null, true);
-    
-    // Permitir todos los subdominios de Vercel (para previews)
-    if (origin.includes('vercel.app')) {
+    // Permitir peticiones sin origin (Postman, servidor mismo, etc)
+    if (!origin) {
       return callback(null, true);
     }
     
-    // Verificar si está en la lista de permitidos
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
+    // Lista de orígenes permitidos
+    const allowedOrigins = [
+      'http://localhost:5173',
+      'http://127.0.0.1:5173',
+      'https://portion-tracker-frontend.vercel.app'
+    ];
     
-    // Si no está permitido
-    return callback(new Error(`Not allowed by CORS: ${origin}`));
+    // Permitir cualquier subdominio de Vercel (para previews)
+    const isVercelPreview = origin.includes('.vercel.app');
+    const isAllowedOrigin = allowedOrigins.includes(origin);
+    
+    if (isAllowedOrigin || isVercelPreview) {
+      callback(null, true);
+    } else {
+      console.log('CORS bloqueado para origen:', origin);
+      callback(null, false); // Cambiar a false en lugar de lanzar error
+    }
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // Postman/CLI
-    if (allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'));
-  },
-  credentials: true
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  optionsSuccessStatus: 200
 }));
 
 // CREDENCIALES Y CONFIGURACIÓN
