@@ -26,7 +26,9 @@ const authLimiter = rateLimit({
 const allowedOrigins = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
-  process.env.FRONTEND_ORIGIN // p.ej. https://tu-frontend.vercel.app
+  process.env.FRONTEND_ORIGIN, // tu dominio principal
+  'https://portion-tracker-frontend.vercel.app', // preview actual
+  'https://portion-tracker*.vercel.app' // para permitir todos los previews (menos seguro)
 ];
 
 app.use(cors({
