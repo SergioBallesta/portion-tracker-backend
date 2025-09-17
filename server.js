@@ -400,7 +400,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     }
 
     // VERIFICAR SI EL EMAIL ESTÁ EN LA WHITELIST
-    const whitelistCheck = await pool.query(
+    /*const whitelistCheck = await pool.query(
       'SELECT * FROM email_whitelist WHERE LOWER(email) = LOWER($1)',
       [email]
     );
@@ -409,7 +409,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       return res.status(403).json({ 
         error: 'Este email no está autorizado para registrarse. Contacta al administrador.' 
       });
-    }
+    }*/
 
     // Verificar si el usuario ya existe
     const existingUser = await findUserByEmail(email);
