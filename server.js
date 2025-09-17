@@ -86,13 +86,18 @@ if (DATABASE_URL) {
     );
     
     CREATE TABLE IF NOT EXISTS user_profiles (
-      user_id INTEGER PRIMARY KEY REFERENCES users(id),
-      meal_names JSONB,
-      meal_count INTEGER,
-      portion_distribution JSONB,
-      personal_foods JSONB,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+	  user_id INTEGER PRIMARY KEY REFERENCES users(id),
+	  first_name VARCHAR(100),
+	  last_name VARCHAR(100),
+	  birth_date DATE,
+	  current_weight DECIMAL(5,2),
+	  weight_history JSONB DEFAULT '[]',
+	  meal_names JSONB,
+	  meal_count INTEGER,
+	  portion_distribution JSONB,
+	  personal_foods JSONB,
+	  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
     
     CREATE TABLE IF NOT EXISTS consumed_foods (
       id SERIAL PRIMARY KEY,
@@ -112,7 +117,7 @@ let accessToken = null;
 let tokenExpiry = null;
 
 // MIDDLEWARE DE AUTENTICACIÓN
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
@@ -120,13 +125,25 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ error: 'Token requerido' });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // Validar que el usuario existe en la base de datos
+    const user = await findUserById(decoded.userId);
+    if (!user) {
+      return res.status(403).json({ error: 'Usuario no válido' });
+    }
+    
+    // Validar que el email coincide
+    if (user.email !== decoded.email) {
       return res.status(403).json({ error: 'Token inválido' });
     }
-    req.user = user;
+    
+    req.user = decoded;
     next();
-  });
+  } catch (err) {
+    return res.status(403).json({ error: 'Token inválido o expirado' });
+  }
 };
 
 // HELPER FUNCTIONS PARA BASE DE DATOS
@@ -188,18 +205,32 @@ const updateUserProfile = async (userId, profileData) => {
   if (!pool) throw new Error('Base de datos no disponible');
   
   const result = await pool.query(
-    `INSERT INTO user_profiles (user_id, meal_names, meal_count, portion_distribution, personal_foods, updated_at) 
-     VALUES ($1, $2, $3, $4, $5, NOW()) 
-     ON CONFLICT (user_id) 
-     DO UPDATE SET 
-       meal_names = $2,
-       meal_count = $3,
-       portion_distribution = $4,
-       personal_foods = $5,
-       updated_at = NOW()
-     RETURNING *`,
+    `INSERT INTO user_profiles (
+      user_id, first_name, last_name, birth_date, 
+      current_weight, weight_history, meal_names, 
+      meal_count, portion_distribution, personal_foods, updated_at
+    ) 
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW()) 
+    ON CONFLICT (user_id) 
+    DO UPDATE SET 
+      first_name = $2,
+      last_name = $3,
+      birth_date = $4,
+      current_weight = $5,
+      weight_history = $6,
+      meal_names = $7,
+      meal_count = $8,
+      portion_distribution = $9,
+      personal_foods = $10,
+      updated_at = NOW()
+    RETURNING *`,
     [
       userId,
+      profileData.first_name || null,
+      profileData.last_name || null,
+      profileData.birth_date || null,
+      profileData.current_weight || null,
+      JSON.stringify(profileData.weight_history || []),
       JSON.stringify(profileData.meal_names || []),
       profileData.meal_count || 3,
       JSON.stringify(profileData.portion_distribution || {}),
@@ -586,27 +617,16 @@ app.post('/api/search', async (req, res) => {
   }
 });
 
+
+
 // Iniciar servidor
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, '0.0.0.0', async () => {
-  console.log(`✅ Servidor backend iniciado en puerto ${PORT}`);
-  console.log(`📍 API disponible en: http://localhost:${PORT}/api`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
-  
-  if (!pool) {
-    console.error('⚠️ ADVERTENCIA: Base de datos no configurada - el sistema no funcionará');
-  } else {
-    console.log('✅ Conectado a PostgreSQL');
-  }
-  
-  // Probar conexión con FatSecret
-  setTimeout(async () => {
-    console.log('Probando conexión con FatSecret...');
-    const token = await getToken();
-    if (token) {
-      console.log('✅ Backend completamente listo con autenticación y FatSecret!');
-    } else {
-      console.log('⚠️ Problemas con FatSecret API - revisa las credenciales');
-    }
-  }, 2000);
-});
+const token = jwt.sign(
+  { 
+    userId: newUser.id, 
+    email: newUser.email,
+    iat: Math.floor(Date.now() / 1000), // Agregar timestamp explícito
+    jti: `${newUser.id}-${Date.now()}` // JWT ID único
+  },
+  JWT_SECRET,
+  { expiresIn: '30d' }
+);
