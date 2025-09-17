@@ -17,8 +17,8 @@ app.use(express.json());
 
 // Rate limiting para auth endpoints
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 5, // máximo 5 intentos por IP
+  windowMs: 1 * 60 * 1000, // 15 minutos
+  max: 50, // máximo 5 intentos por IP
   message: { error: 'Demasiados intentos, intenta de nuevo más tarde' }
 });
 
