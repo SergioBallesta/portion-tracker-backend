@@ -79,11 +79,21 @@ if (DATABASE_URL) {
   // Crear tablas si no existen
   pool.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      email VARCHAR(255) UNIQUE NOT NULL,
-      password_hash VARCHAR(255) NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
+		  id SERIAL PRIMARY KEY,
+		  email VARCHAR(255) UNIQUE NOT NULL,
+		  password_hash VARCHAR(255) NOT NULL,
+		  is_verified BOOLEAN DEFAULT FALSE,
+		  verification_code VARCHAR(6),
+		  verification_expires TIMESTAMP,
+		  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS email_whitelist (
+		  id SERIAL PRIMARY KEY,
+		  email VARCHAR(255) UNIQUE NOT NULL,
+		  added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		  added_by VARCHAR(255)
+		);
     
     CREATE TABLE IF NOT EXISTS user_profiles (
 	  user_id INTEGER PRIMARY KEY REFERENCES users(id),
@@ -264,6 +274,43 @@ const saveConsumedFoods = async (userId, date, consumedFoods) => {
   );
 };
 
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+
+// Configuración de email (usa variables de entorno)
+const transporter = nodemailer.createTransport({
+  service: 'gmail', // o tu servicio preferido
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS // Usa App Password para Gmail
+  }
+});
+
+// Función para generar código de 6 dígitos
+const generateVerificationCode = () => {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
+// Función para enviar email de verificación
+const sendVerificationEmail = async (email, code) => {
+  const mailOptions = {
+    from: process.env.EMAIL_USER,
+    to: email,
+    subject: 'Código de Verificación - Control de Porciones',
+    html: `
+      <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px;">
+        <h2>Verificación de Cuenta</h2>
+        <p>Tu código de verificación es:</p>
+        <h1 style="color: #2563eb; font-size: 36px; letter-spacing: 5px;">${code}</h1>
+        <p>Este código expirará en 15 minutos.</p>
+        <p style="color: #666; font-size: 14px;">Si no solicitaste este código, ignora este mensaje.</p>
+      </div>
+    `
+  };
+
+  await transporter.sendMail(mailOptions);
+};
+
 // ENDPOINTS DE AUTENTICACIÓN
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
@@ -277,33 +324,62 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
     }
 
+    // VERIFICAR SI EL EMAIL ESTÁ EN LA WHITELIST
+    const whitelistCheck = await pool.query(
+      'SELECT * FROM email_whitelist WHERE LOWER(email) = LOWER($1)',
+      [email]
+    );
+
+    if (whitelistCheck.rows.length === 0) {
+      return res.status(403).json({ 
+        error: 'Este email no está autorizado para registrarse. Contacta al administrador.' 
+      });
+    }
+
     // Verificar si el usuario ya existe
     const existingUser = await findUserByEmail(email);
     if (existingUser) {
-      return res.status(409).json({ error: 'El email ya está registrado' });
+      if (existingUser.is_verified) {
+        return res.status(409).json({ error: 'El email ya está registrado' });
+      } else {
+        // Si existe pero no está verificado, actualizar código
+        const verificationCode = generateVerificationCode();
+        const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutos
+
+        await pool.query(
+          'UPDATE users SET verification_code = $1, verification_expires = $2 WHERE email = $3',
+          [verificationCode, expiresAt, email]
+        );
+
+        await sendVerificationEmail(email, verificationCode);
+
+        return res.status(200).json({
+          message: 'Código de verificación reenviado',
+          requiresVerification: true
+        });
+      }
     }
+
+    // Generar código de verificación
+    const verificationCode = generateVerificationCode();
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
     // Hashear contraseña
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Crear usuario
-    const newUser = await createUser(email, passwordHash);
-
-    // Generar token
-    const token = jwt.sign(
-      { userId: newUser.id, email: newUser.email },
-      JWT_SECRET,
-      { expiresIn: '30d' }
+    // Crear usuario no verificado
+    const userResult = await pool.query(
+      `INSERT INTO users (email, password_hash, is_verified, verification_code, verification_expires) 
+       VALUES ($1, $2, FALSE, $3, $4) RETURNING *`,
+      [email, passwordHash, verificationCode, expiresAt]
     );
 
+    // Enviar email de verificación
+    await sendVerificationEmail(email, verificationCode);
+
     res.status(201).json({
-      message: 'Usuario creado exitosamente',
-      token,
-      user: {
-        id: newUser.id,
-        email: newUser.email,
-        created_at: newUser.created_at
-      }
+      message: 'Usuario creado. Revisa tu email para el código de verificación.',
+      requiresVerification: true
     });
 
   } catch (error) {
@@ -320,21 +396,41 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Email y contraseña son requeridos' });
     }
 
-    // Buscar usuario
     const user = await findUserByEmail(email);
     if (!user) {
       return res.status(401).json({ error: 'Credenciales inválidas' });
     }
 
-    // Verificar contraseña
+    // VERIFICAR SI EL USUARIO ESTÁ VERIFICADO
+    if (!user.is_verified) {
+      // Reenviar código
+      const verificationCode = generateVerificationCode();
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+      await pool.query(
+        'UPDATE users SET verification_code = $1, verification_expires = $2 WHERE id = $3',
+        [verificationCode, expiresAt, user.id]
+      );
+
+      await sendVerificationEmail(email, verificationCode);
+
+      return res.status(403).json({ 
+        error: 'Email no verificado. Se ha enviado un nuevo código.',
+        requiresVerification: true 
+      });
+    }
+
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
     if (!isValidPassword) {
       return res.status(401).json({ error: 'Credenciales inválidas' });
     }
 
-    // Generar token
     const token = jwt.sign(
-      { userId: user.id, email: user.email },
+      { 
+        userId: user.id, 
+        email: user.email,
+        iat: Math.floor(Date.now() / 1000)
+      },
       JWT_SECRET,
       { expiresIn: '30d' }
     );
@@ -344,13 +440,122 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       token,
       user: {
         id: user.id,
-        email: user.email,
-        created_at: user.created_at
+        email: user.email
       }
     });
 
   } catch (error) {
     console.error('Error en login:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// Agregar email a whitelist (proteger con autenticación admin)
+app.post('/api/admin/whitelist', authenticateToken, async (req, res) => {
+  try {
+    const { email, adminPassword } = req.body;
+    
+    // Verificar contraseña de admin
+    if (adminPassword !== process.env.ADMIN_PASSWORD) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
+
+    await pool.query(
+      'INSERT INTO email_whitelist (email, added_by) VALUES ($1, $2) ON CONFLICT (email) DO NOTHING',
+      [email, req.user.email]
+    );
+
+    res.json({ message: 'Email agregado a la lista blanca' });
+  } catch (error) {
+    console.error('Error agregando a whitelist:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// Obtener whitelist
+app.get('/api/admin/whitelist', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM email_whitelist ORDER BY added_at DESC');
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error obteniendo whitelist:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+app.post('/api/auth/verify', authLimiter, async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    if (!email || !code) {
+      return res.status(400).json({ error: 'Email y código son requeridos' });
+    }
+
+    const user = await pool.query(
+      'SELECT * FROM users WHERE LOWER(email) = LOWER($1)',
+      [email]
+    );
+
+    if (user.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    const userData = user.rows[0];
+
+    if (userData.is_verified) {
+      return res.status(400).json({ error: 'El usuario ya está verificado' });
+    }
+
+    // Verificar código y expiración
+    if (userData.verification_code !== code) {
+      return res.status(400).json({ error: 'Código inválido' });
+    }
+
+    if (new Date() > new Date(userData.verification_expires)) {
+      return res.status(400).json({ error: 'El código ha expirado' });
+    }
+
+    // Marcar como verificado
+    await pool.query(
+      'UPDATE users SET is_verified = TRUE, verification_code = NULL, verification_expires = NULL WHERE id = $1',
+      [userData.id]
+    );
+
+    // Crear perfil por defecto
+    await pool.query(
+      `INSERT INTO user_profiles (user_id, meal_names, meal_count, portion_distribution, personal_foods) 
+       VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_id) DO NOTHING`,
+      [
+        userData.id,
+        JSON.stringify(['Desayuno', 'Almuerzo', 'Cena']),
+        3,
+        JSON.stringify({}),
+        JSON.stringify({})
+      ]
+    );
+
+    // Generar token
+    const token = jwt.sign(
+      { 
+        userId: userData.id, 
+        email: userData.email,
+        iat: Math.floor(Date.now() / 1000)
+      },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      message: 'Email verificado exitosamente',
+      token,
+      user: {
+        id: userData.id,
+        email: userData.email
+      }
+    });
+
+  } catch (error) {
+    console.error('Error en verificación:', error);
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
