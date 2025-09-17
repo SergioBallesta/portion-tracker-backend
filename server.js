@@ -123,6 +123,91 @@ if (DATABASE_URL) {
   console.error('⚠️ DATABASE_URL no configurada - el sistema no funcionará correctamente');
 }
 
+// Función de migración para agregar columnas faltantes
+const migrateDatabase = async () => {
+  if (!pool) return;
+  
+  try {
+    console.log('Ejecutando migraciones de base de datos...');
+    
+    // Verificar si las columnas existen y agregarlas si no
+    await pool.query(`
+      -- Agregar columnas de verificación si no existen
+      ALTER TABLE users 
+      ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT TRUE,
+      ADD COLUMN IF NOT EXISTS verification_code VARCHAR(6),
+      ADD COLUMN IF NOT EXISTS verification_expires TIMESTAMP;
+      
+      -- Marcar usuarios existentes como verificados
+      UPDATE users SET is_verified = TRUE WHERE is_verified IS NULL;
+      
+      -- Crear tabla de whitelist si no existe
+      CREATE TABLE IF NOT EXISTS email_whitelist (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        added_by VARCHAR(255)
+      );
+      
+      -- Agregar emails existentes a la whitelist automáticamente
+      INSERT INTO email_whitelist (email, added_by)
+      SELECT email, 'auto-migration' FROM users
+      ON CONFLICT (email) DO NOTHING;
+    `);
+    
+    console.log('✅ Migraciones completadas exitosamente');
+  } catch (error) {
+    console.error('Error en migración:', error);
+  }
+};
+
+// Modificar la inicialización del pool
+if (DATABASE_URL) {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false
+    }
+  });
+  
+  // Primero crear tablas base
+  pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS user_profiles (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      first_name VARCHAR(100),
+      last_name VARCHAR(100),
+      birth_date DATE,
+      current_weight DECIMAL(5,2),
+      weight_history JSONB DEFAULT '[]',
+      meal_names JSONB,
+      meal_count INTEGER,
+      portion_distribution JSONB,
+      personal_foods JSONB,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS consumed_foods (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id),
+      date DATE,
+      consumed_foods JSONB,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, date)
+    );
+  `).then(async () => {
+    console.log('✅ Tablas base creadas/verificadas');
+    // Ejecutar migraciones después de crear tablas base
+    await migrateDatabase();
+  }).catch(err => console.error('Error creando tablas:', err));
+}
+
 let accessToken = null;
 let tokenExpiry = null;
 
@@ -401,23 +486,34 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Credenciales inválidas' });
     }
 
-    // VERIFICAR SI EL USUARIO ESTÁ VERIFICADO
-    if (!user.is_verified) {
-      // Reenviar código
-      const verificationCode = generateVerificationCode();
-      const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+    // Verificar si el campo is_verified existe y si el usuario está verificado
+    // Para usuarios antiguos, is_verified será null o true después de la migración
+    if (user.is_verified === false) {
+      try {
+        // Solo intentar enviar código si el sistema de email está configurado
+        if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+          const verificationCode = generateVerificationCode();
+          const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
-      await pool.query(
-        'UPDATE users SET verification_code = $1, verification_expires = $2 WHERE id = $3',
-        [verificationCode, expiresAt, user.id]
-      );
+          await pool.query(
+            'UPDATE users SET verification_code = $1, verification_expires = $2 WHERE id = $3',
+            [verificationCode, expiresAt, user.id]
+          );
 
-      await sendVerificationEmail(email, verificationCode);
+          await sendVerificationEmail(email, verificationCode);
 
-      return res.status(403).json({ 
-        error: 'Email no verificado. Se ha enviado un nuevo código.',
-        requiresVerification: true 
-      });
+          return res.status(403).json({ 
+            error: 'Email no verificado. Se ha enviado un nuevo código.',
+            requiresVerification: true 
+          });
+        } else {
+          // Si no hay sistema de email configurado, permitir login
+          console.log('Sistema de verificación no configurado, permitiendo login');
+        }
+      } catch (emailError) {
+        console.error('Error enviando email de verificación:', emailError);
+        // Si falla el envío de email, permitir login para no bloquear usuarios
+      }
     }
 
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
@@ -429,7 +525,8 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       { 
         userId: user.id, 
         email: user.email,
-        iat: Math.floor(Date.now() / 1000)
+        iat: Math.floor(Date.now() / 1000),
+        jti: `${user.id}-${Date.now()}`
       },
       JWT_SECRET,
       { expiresIn: '30d' }
@@ -449,7 +546,6 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
-
 // Agregar email a whitelist (proteger con autenticación admin)
 app.post('/api/admin/whitelist', authenticateToken, async (req, res) => {
   try {
