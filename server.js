@@ -617,16 +617,26 @@ app.post('/api/search', async (req, res) => {
   }
 });
 
-
-
-// Iniciar servidor
-const token = jwt.sign(
-  { 
-    userId: newUser.id, 
-    email: newUser.email,
-    iat: Math.floor(Date.now() / 1000), // Agregar timestamp explícito
-    jti: `${newUser.id}-${Date.now()}` // JWT ID único
-  },
-  JWT_SECRET,
-  { expiresIn: '30d' }
-);
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`Servidor backend iniciado en puerto ${PORT}`);
+  console.log(`API disponible en: http://localhost:${PORT}/api`);
+  console.log(`Health check: http://localhost:${PORT}/api/health`);
+  
+  if (!pool) {
+    console.error('ADVERTENCIA: Base de datos no configurada - el sistema no funcionará');
+  } else {
+    console.log('Conectado a PostgreSQL');
+  }
+  
+  // Probar conexión con FatSecret
+  setTimeout(async () => {
+    console.log('Probando conexión con FatSecret...');
+    const token = await getToken();
+    if (token) {
+      console.log('Backend completamente listo con autenticación y FatSecret!');
+    } else {
+      console.log('Problemas con FatSecret API - revisa las credenciales');
+    }
+  }, 2000);
+});
