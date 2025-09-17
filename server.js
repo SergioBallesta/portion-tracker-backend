@@ -23,7 +23,6 @@ const authLimiter = rateLimit({
 });
 
 // Configurar CORS
-// Configurar CORS
 app.use(cors({
   origin: (origin, callback) => {
     // Permitir peticiones sin origin (Postman, servidor mismo, etc)
@@ -69,25 +68,46 @@ if (!JWT_SECRET || JWT_SECRET === 'tu-super-secreto-jwt-cambiar-en-produccion') 
   console.warn('ADVERTENCIA: Define JWT_SECRET en las variables de entorno');
 }
 
-// SIMULACIÓN DE BASE DE DATOS EN MEMORIA (para desarrollo)
-// En producción deberías usar PostgreSQL, MySQL, etc.
-let database = {
-  users: [
-    // Ejemplo: { id: 1, email: 'test@test.com', password_hash: 'hash', created_at: '2024-01-01' }
-  ],
-  user_profiles: [
-    // Ejemplo: { user_id: 1, meal_names: [...], meal_count: 3, portion_distribution: {}, personal_foods: {} }
-  ],
-  consumed_foods: [
-    // Ejemplo: { id: 1, user_id: 1, date: '2024-01-01', consumed_foods: {} }
-  ]
-};
+// Al inicio del archivo, después de los imports
+const { Pool } = require('pg');
+let pool;
 
-// Si tienes DATABASE_URL, aquí conectarías a la base de datos real
 if (DATABASE_URL) {
-  console.log('DATABASE_URL detectada - conectar a base de datos real aquí');
-  // const { Pool } = require('pg');
-  // const pool = new Pool({ connectionString: DATABASE_URL });
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false
+    }
+  });
+  
+  // Crear tablas si no existen
+  pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS user_profiles (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      meal_names JSONB,
+      meal_count INTEGER,
+      portion_distribution JSONB,
+      personal_foods JSONB,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS consumed_foods (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id),
+      date DATE,
+      consumed_foods JSONB,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, date)
+    );
+  `).then(() => console.log('Tablas creadas/verificadas'))
+    .catch(err => console.error('Error creando tablas:', err));
 }
 
 let accessToken = null;
