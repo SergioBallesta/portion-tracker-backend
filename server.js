@@ -3,6 +3,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
+const { Pool } = require('pg');
 
 // Importar fetch de la forma correcta
 let fetch;
@@ -12,32 +13,32 @@ let fetch;
 
 const app = express();
 
+// Configurar trust proxy para Railway
+app.set('trust proxy', 1);
+
 // Middleware para parsear JSON
 app.use(express.json());
 
 // Rate limiting para auth endpoints
 const authLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 15 minutos
-  max: 50, // máximo 5 intentos por IP
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 10, // máximo 10 intentos por IP
   message: { error: 'Demasiados intentos, intenta de nuevo más tarde' }
 });
 
 // Configurar CORS
 app.use(cors({
   origin: (origin, callback) => {
-    // Permitir peticiones sin origin (Postman, servidor mismo, etc)
     if (!origin) {
       return callback(null, true);
     }
     
-    // Lista de orígenes permitidos
     const allowedOrigins = [
       'http://localhost:5173',
       'http://127.0.0.1:5173',
       'https://portion-tracker-frontend.vercel.app'
     ];
     
-    // Permitir cualquier subdominio de Vercel (para previews)
     const isVercelPreview = origin.includes('.vercel.app');
     const isAllowedOrigin = allowedOrigins.includes(origin);
     
@@ -45,7 +46,7 @@ app.use(cors({
       callback(null, true);
     } else {
       console.log('CORS bloqueado para origen:', origin);
-      callback(null, false); // Cambiar a false en lugar de lanzar error
+      callback(null, false);
     }
   },
   credentials: true,
@@ -57,19 +58,14 @@ app.use(cors({
 // CREDENCIALES Y CONFIGURACIÓN
 const CLIENT_ID = process.env.FATSECRET_CLIENT_ID;
 const CLIENT_SECRET = process.env.FATSECRET_CLIENT_SECRET;
-const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_SECRET = process.env.JWT_SECRET || 'desarrollo-secret-cambiar-en-produccion';
 const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error('Faltan FATSECRET_CLIENT_ID o FATSECRET_CLIENT_SECRET');
 }
 
-if (!JWT_SECRET || JWT_SECRET === 'tu-super-secreto-jwt-cambiar-en-produccion') {
-  console.warn('ADVERTENCIA: Define JWT_SECRET en las variables de entorno');
-}
-
-// Al inicio del archivo, después de los imports
-const { Pool } = require('pg');
+// Configuración de PostgreSQL
 let pool;
 
 if (DATABASE_URL) {
@@ -106,8 +102,10 @@ if (DATABASE_URL) {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(user_id, date)
     );
-  `).then(() => console.log('Tablas creadas/verificadas'))
+  `).then(() => console.log('✅ Tablas creadas/verificadas en PostgreSQL'))
     .catch(err => console.error('Error creando tablas:', err));
+} else {
+  console.error('⚠️ DATABASE_URL no configurada - el sistema no funcionará correctamente');
 }
 
 let accessToken = null;
@@ -131,77 +129,108 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// HELPER FUNCTIONS PARA BASE DE DATOS SIMULADA
-const findUserByEmail = (email) => {
-  return database.users.find(user => user.email === email);
+// HELPER FUNCTIONS PARA BASE DE DATOS
+const findUserByEmail = async (email) => {
+  if (!pool) return null;
+  
+  const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+  return result.rows[0];
 };
 
-const findUserById = (id) => {
-  return database.users.find(user => user.id === id);
+const findUserById = async (id) => {
+  if (!pool) return null;
+  
+  const result = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+  return result.rows[0];
 };
 
-const createUser = (email, passwordHash) => {
-  const newUser = {
-    id: database.users.length + 1,
-    email,
-    password_hash: passwordHash,
-    created_at: new Date().toISOString()
-  };
-  database.users.push(newUser);
+const createUser = async (email, passwordHash) => {
+  if (!pool) throw new Error('Base de datos no disponible');
+  
+  const userResult = await pool.query(
+    'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *',
+    [email, passwordHash]
+  );
+  const newUser = userResult.rows[0];
   
   // Crear perfil por defecto
-  const defaultProfile = {
-    user_id: newUser.id,
-    meal_names: ['Desayuno', 'Almuerzo', 'Cena'],
-    meal_count: 3,
-    portion_distribution: {},
-    personal_foods: {},
-    updated_at: new Date().toISOString()
-  };
-  database.user_profiles.push(defaultProfile);
+  await pool.query(
+    `INSERT INTO user_profiles (user_id, meal_names, meal_count, portion_distribution, personal_foods) 
+     VALUES ($1, $2, $3, $4, $5)`,
+    [
+      newUser.id, 
+      JSON.stringify(['Desayuno', 'Almuerzo', 'Cena']), 
+      3, 
+      JSON.stringify({}), 
+      JSON.stringify({})
+    ]
+  );
   
   return newUser;
 };
 
-const getUserProfile = (userId) => {
-  return database.user_profiles.find(profile => profile.user_id === userId);
-};
-
-const updateUserProfile = (userId, profileData) => {
-  const index = database.user_profiles.findIndex(profile => profile.user_id === userId);
-  if (index !== -1) {
-    database.user_profiles[index] = {
-      ...database.user_profiles[index],
-      ...profileData,
-      updated_at: new Date().toISOString()
+const getUserProfile = async (userId) => {
+  if (!pool) return null;
+  
+  const result = await pool.query('SELECT * FROM user_profiles WHERE user_id = $1', [userId]);
+  if (result.rows[0]) {
+    return {
+      ...result.rows[0],
+      meal_names: result.rows[0].meal_names,
+      portion_distribution: result.rows[0].portion_distribution,
+      personal_foods: result.rows[0].personal_foods
     };
-    return database.user_profiles[index];
   }
   return null;
 };
 
-const getConsumedFoods = (userId, date) => {
-  return database.consumed_foods.find(cf => cf.user_id === userId && cf.date === date);
+const updateUserProfile = async (userId, profileData) => {
+  if (!pool) throw new Error('Base de datos no disponible');
+  
+  const result = await pool.query(
+    `INSERT INTO user_profiles (user_id, meal_names, meal_count, portion_distribution, personal_foods, updated_at) 
+     VALUES ($1, $2, $3, $4, $5, NOW()) 
+     ON CONFLICT (user_id) 
+     DO UPDATE SET 
+       meal_names = $2,
+       meal_count = $3,
+       portion_distribution = $4,
+       personal_foods = $5,
+       updated_at = NOW()
+     RETURNING *`,
+    [
+      userId,
+      JSON.stringify(profileData.meal_names || []),
+      profileData.meal_count || 3,
+      JSON.stringify(profileData.portion_distribution || {}),
+      JSON.stringify(profileData.personal_foods || {})
+    ]
+  );
+  return result.rows[0];
 };
 
-const saveConsumedFoods = (userId, date, consumedFoods) => {
-  const index = database.consumed_foods.findIndex(cf => cf.user_id === userId && cf.date === date);
+const getConsumedFoods = async (userId, date) => {
+  if (!pool) return null;
   
-  if (index !== -1) {
-    database.consumed_foods[index] = {
-      ...database.consumed_foods[index],
-      consumed_foods: consumedFoods,
-      updated_at: new Date().toISOString()
-    };
-  } else {
-    database.consumed_foods.push({
-      id: database.consumed_foods.length + 1,
-      user_id: userId,
-      date,
-      consumed_foods: consumedFoods,
-      created_at: new Date().toISOString()
-    });
-  }
+  const result = await pool.query(
+    'SELECT * FROM consumed_foods WHERE user_id = $1 AND date = $2',
+    [userId, date]
+  );
+  return result.rows[0];
+};
+
+const saveConsumedFoods = async (userId, date, consumedFoods) => {
+  if (!pool) throw new Error('Base de datos no disponible');
+  
+  await pool.query(
+    `INSERT INTO consumed_foods (user_id, date, consumed_foods) 
+     VALUES ($1, $2, $3) 
+     ON CONFLICT (user_id, date) 
+     DO UPDATE SET 
+       consumed_foods = $3,
+       created_at = NOW()`,
+    [userId, date, JSON.stringify(consumedFoods)]
+  );
 };
 
 // ENDPOINTS DE AUTENTICACIÓN
@@ -218,7 +247,8 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     }
 
     // Verificar si el usuario ya existe
-    if (findUserByEmail(email)) {
+    const existingUser = await findUserByEmail(email);
+    if (existingUser) {
       return res.status(409).json({ error: 'El email ya está registrado' });
     }
 
@@ -226,7 +256,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
 
     // Crear usuario
-    const newUser = createUser(email, passwordHash);
+    const newUser = await createUser(email, passwordHash);
 
     // Generar token
     const token = jwt.sign(
@@ -260,7 +290,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     }
 
     // Buscar usuario
-    const user = findUserByEmail(email);
+    const user = await findUserByEmail(email);
     if (!user) {
       return res.status(401).json({ error: 'Credenciales inválidas' });
     }
@@ -294,26 +324,38 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
 });
 
-app.get('/api/auth/me', authenticateToken, (req, res) => {
-  const user = findUserById(req.user.userId);
-  if (!user) {
-    return res.status(404).json({ error: 'Usuario no encontrado' });
-  }
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const user = await findUserById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
 
-  res.json({
-    id: user.id,
-    email: user.email,
-    created_at: user.created_at
-  });
+    res.json({
+      id: user.id,
+      email: user.email,
+      created_at: user.created_at
+    });
+  } catch (error) {
+    console.error('Error en auth/me:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
 });
 
 // ENDPOINTS DE PERFIL DE USUARIO
-app.get('/api/user/profile', authenticateToken, (req, res) => {
+app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
-    const profile = getUserProfile(req.user.userId);
+    const profile = await getUserProfile(req.user.userId);
     
     if (!profile) {
-      return res.status(404).json({ error: 'Perfil no encontrado' });
+      // Si no existe perfil, crear uno por defecto
+      const defaultProfile = await updateUserProfile(req.user.userId, {
+        meal_names: ['Desayuno', 'Almuerzo', 'Cena'],
+        meal_count: 3,
+        portion_distribution: {},
+        personal_foods: {}
+      });
+      return res.json(defaultProfile);
     }
 
     res.json(profile);
@@ -323,20 +365,16 @@ app.get('/api/user/profile', authenticateToken, (req, res) => {
   }
 });
 
-app.put('/api/user/profile', authenticateToken, (req, res) => {
+app.put('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const { meal_names, meal_count, portion_distribution, personal_foods } = req.body;
 
-    const updatedProfile = updateUserProfile(req.user.userId, {
+    const updatedProfile = await updateUserProfile(req.user.userId, {
       meal_names,
       meal_count,
       portion_distribution,
       personal_foods
     });
-
-    if (!updatedProfile) {
-      return res.status(404).json({ error: 'Perfil no encontrado' });
-    }
 
     res.json({
       message: 'Perfil actualizado exitosamente',
@@ -349,10 +387,10 @@ app.put('/api/user/profile', authenticateToken, (req, res) => {
 });
 
 // ENDPOINTS DE ALIMENTOS CONSUMIDOS
-app.get('/api/user/consumed-foods/:date', authenticateToken, (req, res) => {
+app.get('/api/user/consumed-foods/:date', authenticateToken, async (req, res) => {
   try {
     const { date } = req.params;
-    const consumedData = getConsumedFoods(req.user.userId, date);
+    const consumedData = await getConsumedFoods(req.user.userId, date);
 
     res.json({
       date,
@@ -364,7 +402,7 @@ app.get('/api/user/consumed-foods/:date', authenticateToken, (req, res) => {
   }
 });
 
-app.post('/api/user/consumed-foods', authenticateToken, (req, res) => {
+app.post('/api/user/consumed-foods', authenticateToken, async (req, res) => {
   try {
     const { date, consumed_foods } = req.body;
 
@@ -372,7 +410,7 @@ app.post('/api/user/consumed-foods', authenticateToken, (req, res) => {
       return res.status(400).json({ error: 'Fecha y alimentos consumidos son requeridos' });
     }
 
-    saveConsumedFoods(req.user.userId, date, consumed_foods);
+    await saveConsumedFoods(req.user.userId, date, consumed_foods);
 
     res.json({
       message: 'Alimentos consumidos guardados exitosamente',
@@ -385,7 +423,7 @@ app.post('/api/user/consumed-foods', authenticateToken, (req, res) => {
   }
 });
 
-// FUNCIÓN PARA OBTENER TOKEN DE FATSECRET (sin cambios)
+// FUNCIÓN PARA OBTENER TOKEN DE FATSECRET
 async function getToken() {
   if (accessToken && tokenExpiry && Date.now() < tokenExpiry) {
     return accessToken;
@@ -426,7 +464,7 @@ async function getToken() {
   return null;
 }
 
-// ENDPOINTS EXISTENTES DE FATSECRET (sin cambios)
+// ENDPOINTS DE FATSECRET
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'OK', 
@@ -434,7 +472,7 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     fatsecret: accessToken ? 'Conectado' : 'Desconectado',
     auth: 'Habilitado',
-    database: DATABASE_URL ? 'PostgreSQL' : 'Memoria (desarrollo)'
+    database: pool ? 'PostgreSQL' : 'No configurada'
   });
 });
 
@@ -536,19 +574,10 @@ app.post('/api/search', async (req, res) => {
     } else {
       const errorText = await apiResponse.text();
       console.error('Error de FatSecret API:', apiResponse.status, errorText);
-      
-      try {
-        const errorJson = JSON.parse(errorText);
-        res.status(apiResponse.status).json({ 
-          error: 'Error en FatSecret API', 
-          details: errorJson 
-        });
-      } catch {
-        res.status(apiResponse.status).json({ 
-          error: 'Error en FatSecret API', 
-          details: errorText 
-        });
-      }
+      res.status(apiResponse.status).json({ 
+        error: 'Error en FatSecret API', 
+        details: errorText 
+      });
     }
 
   } catch (error) {
@@ -557,140 +586,27 @@ app.post('/api/search', async (req, res) => {
   }
 });
 
-app.post('/api/food/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    console.log(`Obteniendo detalles del alimento ID: ${id}`);
-    
-    const token = await getToken();
-
-    if (!token) {
-      return res.status(500).json({ error: 'No se pudo conectar con FatSecret' });
-    }
-
-    if (!fetch) {
-      const fetchModule = await import('node-fetch');
-      fetch = fetchModule.default;
-    }
-
-    const params = new URLSearchParams({
-      method: 'food.get',
-      food_id: id,
-      format: 'json'
-    });
-
-    const apiResponse = await fetch(`https://platform.fatsecret.com/rest/server.api?${params}`, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (apiResponse.ok) {
-      const data = await apiResponse.json();
-      console.log('Detalles nutricionales completos obtenidos');
-      res.json(data);
-    } else {
-      const errorText = await apiResponse.text();
-      console.error('Error obteniendo detalles:', apiResponse.status, errorText);
-      res.status(apiResponse.status).json({ error: 'Error obteniendo detalles del alimento' });
-    }
-
-  } catch (error) {
-    console.error('Error obteniendo detalles:', error.message);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
-});
-
-app.get('/api/test-search/:query', async (req, res) => {
-  try {
-    const query = req.params.query;
-    console.log(`PRUEBA: Buscando "${query}"`);
-    
-    const token = await getToken();
-    if (!token) {
-      return res.status(500).json({ error: 'No hay token disponible' });
-    }
-
-    if (!fetch) {
-      const fetchModule = await import('node-fetch');
-      fetch = fetchModule.default;
-    }
-
-    const params = new URLSearchParams({
-      method: 'foods.search',
-      search_expression: query,
-      format: 'json',
-      max_results: 5
-    });
-
-    const apiResponse = await fetch(`https://platform.fatsecret.com/rest/server.api?${params}`, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const data = await apiResponse.json();
-    console.log('RESULTADO DE PRUEBA:', JSON.stringify(data, null, 2));
-    
-    res.json({
-      status: apiResponse.status,
-      data: data
-    });
-
-  } catch (error) {
-    console.error('ERROR EN PRUEBA:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ENDPOINT PARA VER DATOS DE DESARROLLO (solo en desarrollo)
-if (!DATABASE_URL) {
-  app.get('/api/debug/database', (req, res) => {
-    res.json({
-      message: 'Base de datos en memoria (solo desarrollo)',
-      data: {
-        users_count: database.users.length,
-        profiles_count: database.user_profiles.length,
-        consumed_foods_count: database.consumed_foods.length,
-        users: database.users.map(u => ({ id: u.id, email: u.email, created_at: u.created_at }))
-      }
-    });
-  });
-}
-
 // Iniciar servidor
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, '0.0.0.0', async () => {
-  console.log(`Servidor backend iniciado en puerto ${PORT}`);
-  console.log(`API disponible en: http://localhost:${PORT}/api`);
-  console.log(`Health check: http://localhost:${PORT}/api/health`);
-  console.log(`Test search: http://localhost:${PORT}/api/test-search/chicken`);
+  console.log(`✅ Servidor backend iniciado en puerto ${PORT}`);
+  console.log(`📍 API disponible en: http://localhost:${PORT}/api`);
+  console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
   
-  if (!DATABASE_URL) {
-    console.log(`Debug database: http://localhost:${PORT}/api/debug/database`);
-    console.log('MODO DESARROLLO: Usando base de datos en memoria');
+  if (!pool) {
+    console.error('⚠️ ADVERTENCIA: Base de datos no configurada - el sistema no funcionará');
+  } else {
+    console.log('✅ Conectado a PostgreSQL');
   }
-  
-  console.log('ENDPOINTS DE AUTENTICACIÓN:');
-  console.log('- POST /api/auth/register');
-  console.log('- POST /api/auth/login');
-  console.log('- GET /api/auth/me');
-  console.log('- GET /api/user/profile');
-  console.log('- PUT /api/user/profile');
-  console.log('- GET /api/user/consumed-foods/:date');
-  console.log('- POST /api/user/consumed-foods');
-  console.log('');
   
   // Probar conexión con FatSecret
   setTimeout(async () => {
     console.log('Probando conexión con FatSecret...');
     const token = await getToken();
     if (token) {
-      console.log('Backend completamente listo con autenticación!');
+      console.log('✅ Backend completamente listo con autenticación y FatSecret!');
     } else {
-      console.log('Problemas con FatSecret API - revisa las credenciales');
+      console.log('⚠️ Problemas con FatSecret API - revisa las credenciales');
     }
   }, 2000);
 });
