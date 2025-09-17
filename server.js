@@ -299,33 +299,23 @@ const getUserProfile = async (userId) => {
 const updateUserProfile = async (userId, profileData) => {
   if (!pool) throw new Error('Base de datos no disponible');
   
+  // Por ahora, solo guardar los campos que SÍ existen
   const result = await pool.query(
     `INSERT INTO user_profiles (
-      user_id, first_name, last_name, birth_date, 
-      current_weight, weight_history, meal_names, 
-      meal_count, portion_distribution, personal_foods, updated_at
+      user_id, meal_names, meal_count, 
+      portion_distribution, personal_foods, updated_at
     ) 
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW()) 
+    VALUES ($1, $2, $3, $4, $5, NOW()) 
     ON CONFLICT (user_id) 
     DO UPDATE SET 
-      first_name = $2,
-      last_name = $3,
-      birth_date = $4,
-      current_weight = $5,
-      weight_history = $6,
-      meal_names = $7,
-      meal_count = $8,
-      portion_distribution = $9,
-      personal_foods = $10,
+      meal_names = $2,
+      meal_count = $3,
+      portion_distribution = $4,
+      personal_foods = $5,
       updated_at = NOW()
     RETURNING *`,
     [
       userId,
-      profileData.first_name || null,
-      profileData.last_name || null,
-      profileData.birth_date || null,
-      profileData.current_weight || null,
-      JSON.stringify(profileData.weight_history || []),
       JSON.stringify(profileData.meal_names || []),
       profileData.meal_count || 3,
       JSON.stringify(profileData.portion_distribution || {}),
