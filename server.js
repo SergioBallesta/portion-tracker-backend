@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
+const { OAuth2Client } = require('google-auth-library');
 
 // Importar fetch de la forma correcta
 let fetch;
@@ -60,10 +61,73 @@ const CLIENT_ID = process.env.FATSECRET_CLIENT_ID;
 const CLIENT_SECRET = process.env.FATSECRET_CLIENT_SECRET;
 const JWT_SECRET = process.env.JWT_SECRET || 'desarrollo-secret-cambiar-en-produccion';
 const DATABASE_URL = process.env.DATABASE_URL;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '748727037901-fsel2fqut0e29k46sm1cv5jhbbeoai5t.apps.googleusercontent.com';
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error('Faltan FATSECRET_CLIENT_ID o FATSECRET_CLIENT_SECRET');
 }
+
+const verifyGoogleToken = async (token) => {
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: token,
+      audience: GOOGLE_CLIENT_ID
+    });
+    const payload = ticket.getPayload();
+    return {
+      googleId: payload['sub'],
+      email: payload['email'],
+      name: payload['name'],
+      picture: payload['picture']
+    };
+  } catch (error) {
+    console.error('Error verificando token de Google:', error);
+    return null;
+  }
+};
+// NUEVA FUNCIÓN: Buscar o crear usuario con Google
+const findOrCreateGoogleUser = async (googleData) => {
+  if (!pool) throw new Error('Base de datos no disponible');
+  
+  // Buscar usuario existente por email
+  let user = await pool.query(
+    'SELECT * FROM users WHERE email = $1',
+    [googleData.email]
+  );
+  
+  if (user.rows.length > 0) {
+    // Usuario existe, actualizar datos de Google si es necesario
+    await pool.query(
+      'UPDATE users SET google_id = $1, name = $2, picture = $3 WHERE id = $4',
+      [googleData.googleId, googleData.name, googleData.picture, user.rows[0].id]
+    );
+    return user.rows[0];
+  }
+  
+  // Crear nuevo usuario con Google
+  const userResult = await pool.query(
+    'INSERT INTO users (email, google_id, name, picture, is_verified, password_hash) VALUES ($1, $2, $3, $4, TRUE, $5) RETURNING *',
+    [googleData.email, googleData.googleId, googleData.name, googleData.picture, 'google-auth-no-password']
+  );
+  const newUser = userResult.rows[0];
+  
+  // Crear perfil por defecto
+  await pool.query(
+    `INSERT INTO user_profiles (user_id, meal_names, meal_count, portion_distribution, personal_foods) 
+     VALUES ($1, $2, $3, $4, $5)`,
+    [
+      newUser.id, 
+      JSON.stringify(['Desayuno', 'Almuerzo', 'Cena']), 
+      3, 
+      JSON.stringify({}), 
+      JSON.stringify({})
+    ]
+  );
+  
+  return newUser;
+};
+
 
 // Configuración de PostgreSQL
 let pool;
@@ -130,29 +194,18 @@ const migrateDatabase = async () => {
   try {
     console.log('Ejecutando migraciones de base de datos...');
     
-    // Verificar si las columnas existen y agregarlas si no
     await pool.query(`
-      -- Agregar columnas de verificación si no existen
+      -- Agregar columnas de Google si no existen
       ALTER TABLE users 
+      ADD COLUMN IF NOT EXISTS google_id VARCHAR(255) UNIQUE,
+      ADD COLUMN IF NOT EXISTS name VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS picture TEXT,
       ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT TRUE,
       ADD COLUMN IF NOT EXISTS verification_code VARCHAR(6),
       ADD COLUMN IF NOT EXISTS verification_expires TIMESTAMP;
       
       -- Marcar usuarios existentes como verificados
       UPDATE users SET is_verified = TRUE WHERE is_verified IS NULL;
-      
-      -- Crear tabla de whitelist si no existe
-      CREATE TABLE IF NOT EXISTS email_whitelist (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        added_by VARCHAR(255)
-      );
-      
-      -- Agregar emails existentes a la whitelist automáticamente
-      INSERT INTO email_whitelist (email, added_by)
-      SELECT email, 'auto-migration' FROM users
-      ON CONFLICT (email) DO NOTHING;
     `);
     
     console.log('✅ Migraciones completadas exitosamente');
@@ -387,6 +440,52 @@ const sendVerificationEmail = async (email, code) => {
 };
 
 // ENDPOINTS DE AUTENTICACIÓN
+// NUEVO ENDPOINT: Login con Google (agregar después de los endpoints existentes)
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { token } = req.body;
+    
+    if (!token) {
+      return res.status(400).json({ error: 'Token de Google requerido' });
+    }
+    
+    // Verificar token con Google
+    const googleData = await verifyGoogleToken(token);
+    
+    if (!googleData) {
+      return res.status(401).json({ error: 'Token de Google inválido' });
+    }
+    
+    // Buscar o crear usuario
+    const user = await findOrCreateGoogleUser(googleData);
+    
+    // Generar JWT
+    const jwtToken = jwt.sign(
+      { 
+        userId: user.id, 
+        email: user.email,
+        name: user.name || user.email
+      },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+    
+    res.json({
+      token: jwtToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        picture: user.picture
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error en autenticación con Google:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
